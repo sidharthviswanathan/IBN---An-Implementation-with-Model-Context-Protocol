@@ -1,18 +1,27 @@
+# ibn_assistant.py
+
 import asyncio
-import ipaddress
 import json
+import logging
 import os
-import secrets
-import sqlite3
 import sys
-from datetime import datetime, timezone
+import yaml
+
 from pathlib import Path
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.server.mcpserver import MCPServer
+
 from openai import AsyncOpenAI
-from pydantic import BaseModel, ConfigDict, Field
+
+from controller import (
+    InvalidApprovalLimit,
+    ask_approval,
+    audit,
+)
+from intent_config import Intent, load_config
+from mcp_tools import register_tools
 
 
 # ---------------------------------------------------------
@@ -20,260 +29,103 @@ from pydantic import BaseModel, ConfigDict, Field
 # ---------------------------------------------------------
 
 SCRIPT = Path(__file__).resolve()
-DB_PATH = SCRIPT.with_name("ibn_audit.sqlite3")
 
-mcp = MCPServer("local-network-assistant")
+# MCP 2.x: MCPServer replaces FastMCP.
+mcp = MCPServer("local-intent-assistant")
+register_tools(mcp)
 
+# Only these tools are exposed to the model.
+# Execution and discard remain application-controlled.
+MODEL_TOOLS = {
+    "list_intents",
+    "upsert_intent",
+    "propose_inspection",
+    "propose_repair",
+}
 
-# Plans exist only in the MCP server process.
-PENDING_PLANS = {}
+INSTRUCTIONS = """
+You are a terminal server administration assistant.
 
+Ordinary questions do not require tools.
 
-SYSTEM_INSTRUCTIONS = """
-You are a server administration assistant in a terminal.
+Distinguish:
+1. Desired configuration stored in YAML.
+2. Actual firewall or service state observed through commands.
 
-For ordinary questions, respond normally without using tools.
+Configuration:
+- Use list_intents to read configured intents.
+- Use upsert_intent to add or update desired policy.
+- The CLI asks approval before either operation.
+- An update replaces the intent with the same ID.
+- Ask for missing required details before proposing an intent.
+- Firewall intents require an explicit source CIDR, port, protocol, and
+  rule_action (allow or deny). Use 0.0.0.0/0 for all IPv4 sources.
+- Infer deny when the user says block, and allow when the user says permit.
+- Never assume unrestricted SSH access.
+- TCP may be inferred when omitted, but disclose it.
+- Service intents require an explicit systemd .service unit.
+- Saving YAML does not apply policy or check the server.
+- Never claim otherwise.
+- Do not say conversational intent editing is unavailable.
 
-For firewall requests:
-- Use the available proposal tools when appropriate.
-- A proposal does not execute a command.
-- The application separately asks the user for approval.
-- Never claim a change was made unless execution succeeded.
-- If a request is ambiguous, ask a clarification question.
-- For inbound access, default the destination to this server.
-- Default the protocol to TCP when omitted, but explicitly state
-  that interpretation in your response or proposal.
-- Before the first firewall modification in a conversation,
-  propose checking UFW status.
-- If UFW is inactive, do not propose enabling it or pretend that
-  adding a rule provides active protection.
-- If a command is rejected, acknowledge the rejection and stop
-  that workflow. Do not immediately propose another command.
-- A successful UFW command is not proof of end-to-end connectivity.
-- Do not claim to inspect services, open ports, or cloud firewall
-  rules: this version does not have those tools.
-- Do not try to bypass the supported tools using shell commands.
+Actual inspection:
+- Use propose_inspection to check UFW or systemd.
+- The CLI requests approval before executing the command.
+- Report the returned assessment, including uncertainty.
+- UFW rule presence is not proof of reachability.
+- An active systemd unit is not proof of application health.
+
+Repair:
+- Inspect first.
+- Use propose_repair only with supporting fresh evidence.
+- After successful repair, propose another inspection.
+- Inspection, repair, and verification require separate approvals.
+- Never enable UFW, flush rules, remove unrelated rules,
+  or invent shell commands.
+
+After saving a firewall intent, inspect UFW and, if the exact rule is
+missing, propose a repair, then propose verification. Each command needs
+its own approval. Do not repair when inspection is inactive or indeterminate.
+
+On rejection, acknowledge and stop that workflow.
+On errors or timeouts, do not retry automatically.
+Never claim execution succeeded without tool evidence.
+
+Use upsert_intent when the user asks to create or update an intent.
+Ask for missing required details.
+The application requests approval before saving.
+Saving an intent does not itself apply firewall policy; follow it with the
+approved inspection and repair workflow.
 """
 
-
-# ---------------------------------------------------------
-# Input schemas
-# ---------------------------------------------------------
-
-class StatusArguments(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-
-class AllowArguments(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    source_ip: str = Field(
-        description="One IPv4 or IPv6 source address, without a CIDR suffix."
-    )
-    destination_port: int = Field(ge=1, le=65535)
-    protocol: str = Field(
-        pattern="^(tcp|udp)$",
-        description="Transport protocol: tcp or udp.",
-    )
-
-
-# ---------------------------------------------------------
-# SQLite audit
-# ---------------------------------------------------------
-
-def initialize_database():
-    with sqlite3.connect(DB_PATH) as connection:
-        connection.execute("""
-            CREATE TABLE IF NOT EXISTS audit_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                payload TEXT NOT NULL
-            )
-        """)
-
-
-def audit(event_type, payload):
-    with sqlite3.connect(DB_PATH) as connection:
-        connection.execute(
-            """
-            INSERT INTO audit_events(timestamp, event_type, payload)
-            VALUES (?, ?, ?)
-            """,
-            (
-                datetime.now(timezone.utc).isoformat(),
-                event_type,
-                json.dumps(payload),
-            ),
-        )
-
-
-# ---------------------------------------------------------
-# MCP server: prepare plans without running commands
-# ---------------------------------------------------------
-
-def privileged_command(arguments):
-    if os.geteuid() == 0:
-        return arguments
-
-    # Never block on an unexpected interactive sudo password prompt.
-    return ["sudo", "-n", *arguments]
-
-
-def create_plan(purpose, arguments):
-    import shlex
-
-    plan_id = secrets.token_urlsafe(24)
-
-    plan = {
-        "plan_id": plan_id,
-        "purpose": purpose,
-        "argv": privileged_command(arguments),
-    }
-    plan["command"] = shlex.join(plan["argv"])
-
-    PENDING_PLANS[plan_id] = plan
-    return plan
-
-
-@mcp.tool()
-def propose_ufw_status() -> dict:
-    """Prepare a read-only UFW status check. Does not execute it."""
-    return create_plan(
-        "Inspect UFW status and default policies. Read-only operation.",
-        ["ufw", "status", "verbose"],
-    )
-
-
-@mcp.tool()
-def propose_ufw_allow_inbound(
-    source_ip: str,
-    destination_port: int,
-    protocol: str,
-) -> dict:
-    """Prepare an inbound UFW allow rule. Does not execute it."""
-    arguments = AllowArguments(
-        source_ip=source_ip,
-        destination_port=destination_port,
-        protocol=protocol,
-    )
-
-    # Reject arbitrary text, ranges, and shell syntax.
-    address = str(ipaddress.ip_address(arguments.source_ip))
-
-    return create_plan(
-        (
-            f"Allow incoming {arguments.protocol.upper()} traffic "
-            f"from {address} to destination port "
-            f"{arguments.destination_port} on this server. "
-            "Existing default policies will not be changed."
-        ),
-        [
-            "ufw",
-            "allow",
-            "in",
-            "proto",
-            arguments.protocol,
-            "from",
-            address,
-            "to",
-            "any",
-            "port",
-            str(arguments.destination_port),
-        ],
-    )
-
-
-@mcp.tool()
-async def execute_plan(plan_id: str) -> dict:
-    """Execute a pending plan. Called only by the CLI after approval."""
-    # One-use plan: it cannot be executed twice.
-    plan = PENDING_PLANS.pop(plan_id, None)
-
-    if plan is None:
-        return {"error": "Unknown, expired, or already consumed plan."}
-
+def approve_operation(operation_name, proposal):
     try:
-        process = await asyncio.create_subprocess_exec(
-            *plan["argv"],
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            # Prevent commands from asking additional terminal questions.
-            stdin=asyncio.subprocess.DEVNULL,
-            env={**os.environ, "LC_ALL": "C"},
-        )
+        approved = ask_approval(proposal)
 
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(),
-                timeout=30,
-            )
-        except asyncio.TimeoutError:
-            process.kill()
-            stdout, stderr = await process.communicate()
-            return {
-                "command": plan["command"],
-                "error": (
-                    "Command timed out. Its final effect is unknown; "
-                    "inspect state before retrying."
-                ),
-                "stdout": stdout.decode(errors="replace"),
-                "stderr": stderr.decode(errors="replace"),
-            }
+    except (InvalidApprovalLimit, EOFError, KeyboardInterrupt):
+        audit("operation_approval_aborted", {
+            "operation": operation_name,
+        })
+        raise
 
-        return {
-            "command": plan["command"],
-            "returncode": process.returncode,
-            "stdout": stdout.decode(errors="replace"),
-            "stderr": stderr.decode(errors="replace"),
-        }
+    audit("operation_approval", {
+        "operation": operation_name,
+        "approved": approved,
+    })
 
-    except OSError as error:
-        return {
-            "command": plan["command"],
-            "error": str(error),
-        }
-
-
-@mcp.tool()
-def discard_plan(plan_id: str) -> dict:
-    """Discard a pending plan without executing it."""
-    PENDING_PLANS.pop(plan_id, None)
-    return {"discarded": True}
-
-
+    return approved
 # ---------------------------------------------------------
-# CLI approval and MCP response handling
+# MCP response handling
 # ---------------------------------------------------------
-
-class InvalidApprovalLimit(Exception):
-    pass
-
-
-def ask_approval(plan):
-    print("\nTool use")
-    print(f"\nPurpose:\n{plan['purpose']}")
-    print(f"\nCommand:\n{plan['command']}")
-
-    for attempt in range(1, 4):
-        answer = input(
-            "\nDo you want to run this? (yes/no)\n-> "
-        ).strip().lower()
-
-        if answer == "yes":
-            return True
-
-        if answer == "no":
-            return False
-
-        if attempt < 3:
-            print("Invalid option. Please enter yes or no.")
-        else:
-            print("Invalid option. Three invalid responses. Exiting.")
-            raise InvalidApprovalLimit()
-
 
 def unpack_mcp_result(result):
+    """
+    Decode an MCP 2.x CallToolResult.
+
+    MCP 2.x uses:
+        is_error
+        structured_content
+    """
     texts = [
         block.text
         for block in result.content
@@ -288,51 +140,148 @@ def unpack_mcp_result(result):
     if result.structured_content is not None:
         return result.structured_content
 
-    return json.loads(text)
+    if not text:
+        raise RuntimeError("MCP tool returned no result.")
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            f"MCP tool returned invalid JSON: {text}"
+        ) from error
 
 
 async def call_mcp(session, name, arguments):
-    result = await session.call_tool(name, arguments=arguments)
-    return unpack_mcp_result(result)
+    response = await session.call_tool(
+        name,
+        arguments=arguments,
+    )
+
+    result = unpack_mcp_result(response)
+
+    if not isinstance(result, dict):
+        raise RuntimeError(
+            f"MCP tool {name!r} returned a non-object result."
+        )
+
+    return result
 
 
-async def handle_proposal(session, tool_name, raw_arguments):
-    validators = {
-        "propose_ufw_status": StatusArguments,
-        "propose_ufw_allow_inbound": AllowArguments,
-    }
+# ---------------------------------------------------------
+# Approval and execution
+# ---------------------------------------------------------
 
-    if tool_name not in validators:
-        return {"error": "Unsupported tool."}
+async def discard_pending_plan(session, plan_id):
+    """
+    Attempt cleanup without hiding the original cancellation.
+    No operating-system command is executed by discard_plan.
+    """
+    try:
+        await call_mcp(
+            session,
+            "discard_plan",
+            {"plan_id": plan_id},
+        )
+    except Exception as error:
+        print(
+            f"\nWarning: could not discard pending plan: {error}",
+            file=sys.stderr,
+        )
+
+
+async def handle_tool(session, name, raw_arguments):
+    if name not in MODEL_TOOLS:
+        return {"error": "Unsupported model tool."}
 
     try:
-        validated = validators[tool_name].model_validate_json(
-            raw_arguments
-        ).model_dump()
+        arguments = json.loads(raw_arguments)
 
-        plan = await call_mcp(session, tool_name, validated)
+        if not isinstance(arguments, dict):
+            raise ValueError("Tool arguments must be an object.")
+
+        if name == "list_intents":
+            if arguments:
+                raise ValueError(
+                    "list_intents does not accept arguments."
+                )
+
+            proposal = {
+                "purpose": "Read configured desired-state intents.",
+                "operation": (
+                    "Read intents.yaml.\n"
+                    "This does not inspect the running firewall "
+                    "or services."
+                ),
+            }
+
+        elif name == "upsert_intent":
+            if set(arguments) != {"intent"}:
+                raise ValueError(
+                    "upsert_intent requires only an intent argument."
+                )
+
+            intent = Intent.model_validate(arguments["intent"])
+
+            arguments = {
+                "intent": intent.model_dump(exclude_none=True),
+            }
+
+            proposal = {
+                "purpose": (
+                    "Add a desired-state intent, or replace the "
+                    "existing intent with the same ID."
+                ),
+                "operation": (
+                    "Write this intent to intents.yaml:\n\n"
+                    + yaml.safe_dump(
+                        arguments["intent"],
+                        sort_keys=False,
+                    )
+                    + "\nNo firewall or service command will run.\n"
+                    "No unattended authorization will be granted."
+                ),
+            }
+
+        else:
+            proposal = None
+
     except Exception as error:
-        audit("proposal_error", {"error": str(error)})
         return {"error": str(error)}
 
-    # Persist before offering execution.
-    audit("plan_created", plan)
+    # Configuration operations require approval before the MCP call.
+    if proposal is not None:
+        if not approve_operation(name, proposal):
+            return {
+                "status": "rejected",
+                "message": "User rejected the configuration operation.",
+            }
+
+        try:
+            result = await call_mcp(session, name, arguments)
+        except Exception as error:
+            result = {"error": str(error)}
+
+        print("\nConfiguration result:")
+        print(json.dumps(result, indent=2))
+
+        return result
+
+    # Preparing a command does not execute it.
+    try:
+        plan = await call_mcp(session, name, arguments)
+    except Exception as error:
+        return {"error": str(error)}
 
     try:
-        approved = ask_approval(plan)
+        approved = approve_operation(name, plan)
+
     except (InvalidApprovalLimit, EOFError, KeyboardInterrupt):
         await call_mcp(
             session,
             "discard_plan",
             {"plan_id": plan["plan_id"]},
         )
-        audit("approval_aborted", {"plan_id": plan["plan_id"]})
         raise
-
-    audit(
-        "approval",
-        {"plan_id": plan["plan_id"], "approved": approved},
-    )
 
     if not approved:
         await call_mcp(
@@ -340,16 +289,20 @@ async def handle_proposal(session, tool_name, raw_arguments):
             "discard_plan",
             {"plan_id": plan["plan_id"]},
         )
-        return {"status": "rejected", "message": "User rejected command."}
 
-    # Execution is an application decision, not a model tool call.
-    result = await call_mcp(
-        session,
-        "execute_plan",
-        {"plan_id": plan["plan_id"]},
-    )
+        return {
+            "status": "rejected",
+            "message": "User rejected the command.",
+        }
 
-    audit("execution_result", result)
+    try:
+        result = await call_mcp(
+            session,
+            "execute_plan",
+            {"plan_id": plan["plan_id"]},
+        )
+    except Exception as error:
+        result = {"error": str(error)}
 
     print("\nCommand result:")
     print(json.dumps(result, indent=2))
@@ -358,22 +311,23 @@ async def handle_proposal(session, tool_name, raw_arguments):
 
 
 # ---------------------------------------------------------
-# OpenAI conversation loop
+# OpenAI conversation
 # ---------------------------------------------------------
 
 async def run_conversation(session):
+    # Avoid printing the HTTP client's successful OpenAI request logs.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
     model = os.environ.get("OPENAI_MODEL")
+
     if not model:
-        raise RuntimeError("Set OPENAI_MODEL before running the application.")
+        raise RuntimeError(
+            "Set OPENAI_MODEL before running the application."
+        )
 
-    # Discover the tools from MCP, but expose only proposal tools
-    # to the model. Never expose execute_plan.
     discovered = await session.list_tools()
-    permitted_names = {
-        "propose_ufw_status",
-        "propose_ufw_allow_inbound",
-    }
 
+    # MCP 2.x uses tool.input_schema.
     tools = [
         {
             "type": "function",
@@ -382,8 +336,21 @@ async def run_conversation(session):
             "parameters": tool.input_schema,
         }
         for tool in discovered.tools
-        if tool.name in permitted_names
+        if tool.name in MODEL_TOOLS
     ]
+
+    available_names = {
+        tool.name
+        for tool in discovered.tools
+    }
+
+    missing = MODEL_TOOLS - available_names
+
+    if missing:
+        raise RuntimeError(
+            "Required MCP tools were not registered: "
+            + ", ".join(sorted(missing))
+        )
 
     history = []
 
@@ -400,26 +367,33 @@ async def run_conversation(session):
             if not user_text:
                 continue
 
-            audit("user_message", {"text": user_text})
-            history.append({"role": "user", "content": user_text})
+            history.append({
+                "role": "user",
+                "content": user_text,
+            })
 
-            # Bound the number of model/tool rounds per user request.
-            for _ in range(10):
+            # Rejection applies only to this user request.
+            workflow_rejected = False
+
+            for _ in range(12):
                 response = await client.responses.create(
                     model=model,
-                    instructions=SYSTEM_INSTRUCTIONS,
+                    instructions=INSTRUCTIONS,
                     input=history,
                     tools=tools,
+                    tool_choice=(
+                        "none"
+                        if workflow_rejected
+                        else "auto"
+                    ),
                     parallel_tool_calls=False,
                 )
 
                 history.extend(response.output)
 
                 if response.output_text:
-                    print(f"\nAssistant: {response.output_text}")
-                    audit(
-                        "assistant_message",
-                        {"text": response.output_text},
+                    print(
+                        f"\nAssistant: {response.output_text}"
                     )
 
                 calls = [
@@ -432,49 +406,112 @@ async def run_conversation(session):
                     break
 
                 for call in calls:
-                    result = await handle_proposal(
-                        session,
-                        call.name,
-                        call.arguments,
-                    )
+                    if workflow_rejected:
+                        result = {
+                            "status": "rejected",
+                            "message": (
+                                "This workflow was cancelled. "
+                                "No further tools may run until "
+                                "a new user message."
+                            ),
+                        }
+                    else:
+                        result = await handle_tool(
+                            session,
+                            call.name,
+                            call.arguments,
+                        )
+
+                    if result.get("status") == "rejected":
+                        workflow_rejected = True
 
                     history.append({
                         "type": "function_call_output",
                         "call_id": call.call_id,
                         "output": json.dumps(result),
                     })
+
             else:
-                print("Tool round limit reached. Ending this session.")
+                print(
+                    "\nTool round limit reached. "
+                    "Ending this session."
+                )
                 return
 
 
+# ---------------------------------------------------------
+# CLI startup
+# ---------------------------------------------------------
+
 async def run_cli():
-    initialize_database()
+    # Validate configuration before starting MCP or inference.
+    load_config()
+
+    # Explicit environment avoids passing OpenAI credentials
+    # into the networking MCP subprocess.
+    child_env = {
+        "PATH": os.environ.get(
+            "PATH",
+            (
+                "/usr/local/sbin:/usr/local/bin:"
+                "/usr/sbin:/usr/bin:/sbin:/bin"
+            ),
+        ),
+    }
+
+    # Preserve basic runtime environment where present.
+    for key in (
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "VIRTUAL_ENV",
+        "SYSTEMD_BUS_ADDRESS",
+        "DBUS_SYSTEM_BUS_ADDRESS",
+    ):
+        if key in os.environ:
+            child_env[key] = os.environ[key]
 
     parameters = StdioServerParameters(
         command=sys.executable,
-        args=[str(SCRIPT), "--mcp-server"],
-        # The MCP subprocess does not need the OpenAI API key.
-        env={
-            key: value
-            for key, value in os.environ.items()
-            if key != "OPENAI_API_KEY"
-        },
+        args=[
+            str(SCRIPT),
+            "--mcp-server",
+        ],
+        env=child_env,
     )
 
-    async with stdio_client(parameters) as (read_stream, write_stream):
-        async with ClientSession(read_stream, write_stream) as session:
+    async with stdio_client(parameters) as (
+        read_stream,
+        write_stream,
+    ):
+        async with ClientSession(
+            read_stream,
+            write_stream,
+        ) as session:
             await session.initialize()
             await run_conversation(session)
 
 
+# ---------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------
+
 if __name__ == "__main__":
     if "--mcp-server" in sys.argv:
-        # Never print terminal UI text in this mode:
-        # stdout is reserved for the MCP protocol.
+        # Never print terminal UI text here.
+        # stdout is reserved for the MCP stdio protocol.
         mcp.run(transport="stdio")
+
     else:
         try:
             asyncio.run(run_cli())
-        except (InvalidApprovalLimit, EOFError, KeyboardInterrupt):
-            print("\nSession ended. No pending command will be executed.")
+
+        except (
+            InvalidApprovalLimit,
+            EOFError,
+            KeyboardInterrupt,
+        ):
+            print(
+                "\nSession ended. "
+                "No further command will execute."
+            )

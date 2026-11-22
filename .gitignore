@@ -1,2 +1,7 @@
 *.sqlite3
 .env
+/intents.yaml
+/audit.yaml
+*.lock
+__pycache__/
+/readme.bak
