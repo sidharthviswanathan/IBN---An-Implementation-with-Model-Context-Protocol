@@ -84,6 +84,40 @@ For a rule restricted to one address, enter the following. If asked for a source
 
 Both prompts request an allow rule for TCP port 8000. The assistant saves the desired rule to `intents.yaml` after approval and checks for the matching rule in UFW. If you already added it manually, the inspection can find it without adding it again.
 
+### Sample intent configurations
+
+Each example is a complete `intents.yaml`. Choose the source range that matches the access you want.
+
+**Allow TCP port 8000 from `10.0.0.1` only**
+
+```yaml
+version: 1
+intents:
+  - id: example-ingress
+    type: protected_ingress
+    enabled: true
+    source_network: 10.0.0.1/32
+    destination_port: 8000
+    protocol: tcp
+    rule_action: allow
+authorizations: []
+```
+
+**Allow TCP port 8000 from any IPv4 address**
+
+```yaml
+version: 1
+intents:
+  - id: example-public-ingress
+    type: protected_ingress
+    enabled: true
+    source_network: 0.0.0.0/0
+    destination_port: 8000
+    protocol: tcp
+    rule_action: allow
+authorizations: []
+```
+
 ## Step 5. Review each operation and approve it
 
 The assistant uses a local Model Context Protocol (MCP) server. The CLI shows the proposed intent change or shell command before it proceeds. Review the operation and type `yes` to approve it or `no` to reject it and stop that workflow. Saving the intent, inspecting UFW, applying a repair, and verifying the result each require separate approval.
